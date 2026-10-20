@@ -1,47 +1,74 @@
-import pigpio
+import lgpio
 import time
 
-# Establish the necessary PWM signal widths/durations (in microseconds)
+# PWM pulse widths in microseconds
 ARM_CLOSE_WIDTH = 1600
 ARM_NEUTRAL_WIDTH = 1500
 ARM_OPEN_WIDTH = 1400
 
-class Arm:
-    """Create and manage arm"""
 
-    def __init__(self, pigpio_ip, pigpio_port, arm_signal_pin):
-        # Intialize pigpio
-        try: 
-            self.pi = pigpio.pi(pigpio_ip, pigpio_port)
-        except:
-            print("Failed to connect to pigpio daemon")
-        
-        # Initalize arm
-        self.pin = arm_signal_pin 
-        self.pi.set_mode(self.pin, pigpio.OUTPUT) #listener
-        self.pi.set_PWM_frequency(self.pin, 50) # Set frequency to 50Hz 
-    
+class Arm:
+    """Create and manage robotic arm servo using lgpio on RPi 5"""
+
+    def __init__(self, arm_signal_pin, chip_num=4):
+        self.pin = arm_signal_pin
+        self.chip_num = chip_num
+
+        # Open connection to RP1 GPIO chip (gpiochip4 on Pi 5)
+        try:
+            self.chip = lgpio.gpiochip_open(self.chip_num)
+            print(f"Connected to gpiochip{self.chip_num} via lgpio.")
+        except Exception as e:
+            raise RuntimeError(f"Failed to open gpiochip{self.chip_num}: {e}")
+
+        # Claim the GPIO pin as an output
+        lgpio.gpio_claim_output(self.chip, self.pin)
+
+        # Initialize pin to neutral state at 50Hz
+        self.stop()
+
     def close(self):
         '''Sends PWM signals to close arm'''
-        self.pi.set_servo_pulsewidth(self.pin, ARM_CLOSE_WIDTH)
+        print("Closing arm...")
+        lgpio.tx_servo(self.chip, self.pin, ARM_CLOSE_WIDTH, 50)
 
     def open(self):
         '''Sends PWM signals to open arm'''
-        print("opening arm")
-        self.pi.set_servo_pulsewidth(self.pin, ARM_OPEN_WIDTH)
+        print("Opening arm...")
+        lgpio.tx_servo(self.chip, self.pin, ARM_OPEN_WIDTH, 50)
 
-    # Neutral signal
     def stop(self):
-        '''Neutral signal'''
-        self.pi.set_servo_pulsewidth(self.pin, ARM_NEUTRAL_WIDTH)
+        '''Sends neutral PWM signal to hold/stop arm'''
+        print("Arm neutral...")
+        lgpio.tx_servo(self.chip, self.pin, ARM_NEUTRAL_WIDTH, 50)
+
+    def cleanup(self):
+        '''Releases GPIO resources and closes the gpiochip handle'''
+        self.stop()
+        time.sleep(0.1)
+        lgpio.gpiochip_close(self.chip)
+        print("Arm GPIO handle closed successfully.")
+
 
 if __name__ == "__main__":
-    # Testing
-    armTest = Arm("192.168.0.2", 8888)
-    while True:
-        armTest.open()
-        time.sleep(2)
-        armTest.stop()
-        time.sleep(2)
-        armTest.close()
-        time.sleep(2)
+    # Specify the target signal GPIO pin
+    ARM_PIN = 18
+
+    # Instantiate the arm (defaults to gpiochip4 for RPi 5)
+    armTest = Arm(arm_signal_pin=ARM_PIN)
+
+    try:
+        while True:
+            armTest.open()
+            time.sleep(2)
+
+            armTest.stop()
+            time.sleep(2)
+
+            armTest.close()
+            time.sleep(2)
+
+    except KeyboardInterrupt:
+        print("\nTest interrupted by user.")
+    finally:
+        armTest.cleanup()

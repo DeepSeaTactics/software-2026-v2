@@ -19,9 +19,13 @@ ctrls.bind_action_to_function("Arm Open", lambda: print("opening arm"))
 ctrls.bind_action_to_function("Arm Close", lambda: print("closing arm"))
 
 # Main loop for testing
-if __name__ == "__main__":
-    while running:
-        ctrls.handle_events()
-        vec = ctrls.get_input_vector()
-        print(vec)  # For testing, print the input vector to see the values being generated when keys are pressed. This should show a 6-element array corresponding to the DOFs based on the key presses.
-        clock.tick(10)  # Limit to 30 frames per second 
+
+while running:
+    ctrls.handle_events()
+    vec = ctrls.get_input_vector()
+    # For testing, print the input vector to see the values being generated when keys are pressed. This should show a 6-element array corresponding to the DOFs based on the key presses.
+    print(vec)
+
+    # Print the state of all keys (True for pressed, False for not pressed)
+
+    clock.tick(10)  # Limit to 30 frames per second

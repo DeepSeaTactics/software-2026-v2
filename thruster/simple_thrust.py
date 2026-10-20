@@ -1,85 +1,106 @@
-import pigpio
+import lgpio
 import time
 import numpy as np
-from threading import Thread
-
 
 # Inputs: [Surge, Sway, Heave, Roll, Pitch, Yaw]
 # Outputs: [FL, FR, BL, BR, MFL, MFR, MBL, MBR]
 
-# Angle factor 0.7 is 1/sqrt(2) for 45-degree vectored thrusters
-S = 0.707 
+# Angle factor 0.707 is 1/sqrt(2) for 45-degree vectored thrusters
+S = 0.707
 
-# Very brute force impelmentation of amperage limits (according to T200 docs, max amperage is ~23A at full throttle)
-ESC_MAX = 1712  # Max pulse width for ESC (1900 microseconds)
-ESC_MIN = 1288  # Min pulse width for ESC (1100 microseconds)
-ESC_NEUTRAL = 1500  # Neutral pulse width for ESC (1500 microseconds)
-AMPERAGE_LIMIT = 25 # Max amperage for thrusters
-amperage_limit_per_unit = 10 # Set during initialization 
+ESC_MAX = 1712       # Max pulse width in microseconds
+ESC_MIN = 1288       # Min pulse width in microseconds
+ESC_NEUTRAL = 1500   # Neutral pulse width (arming signal)
+AMPERAGE_LIMIT = 22  # Max total amperage
 
 mixer = np.array([
-    [ S,  S,   0,   0,   0,  1], # FL
-    [-S,  S,   0,   0,   0, -1], # FR
-    [-S, -S,   0,   0,   0,  1], # BL
-    [ S, -S,   0,   0,   0, -1], # BR
-    [ 0,  0,   1,  -1,   1,  0], # MFL
-    [ 0,  0,   1,   1,   1,  0], # MFR
-    #[ 0,  0,   1,  -1,  -1,  0], # MBL
-    #[ 0,  0,   1,   1,  -1,  0]  # MBR
+    [S,  S,  0,  0,  0,  1],  # FL
+    [-S,  S,  0,  0,  0, -1],  # FR
+    [-S, -S,  0,  0,  0,  1],  # BL
+    [S, -S,  0,  0,  0, -1],  # BR
+    [0,  0,  1, -1,  1,  0],  # MFL
+    [0,  0,  1,  1,  1,  0],  # MFR
+    # [0,  0,  1, -1, -1,  0],  # MBL
+    # [0,  0,  1,  1, -1,  0]   # MBR
 ])
-#format for thruster outputs is [FL, FR, BL, BR, MFL, MFR, MBL, MBR]
 
-thruster_pins = [16,17,27,22,25,26]  # Example GPIO pins for 8 thrusters/ESCs
+thruster_pins = [16, 17, 27, 22, 25, 26]
+
 
 class Thruster:
-    '''Class to control thrusters using the mixer and GPIO pins'''
-    def __init__(self, pigpio_ip, pigpio_port, mixer, thruster_pins):
-        # intialize pigpio
-        try: 
-            self.pi = pigpio.pi(pigpio_ip, pigpio_port)
-        except:
-            print("Failed to connect to pigpio daemon")
+    '''Class to control thrusters using the mixer matrix and lgpio on RPi 5'''
 
-        # Initialize thruster systems
-        self.mixer = np.array(mixer)  # Mixer matrix to convert DOF inputs to thruster outputs
+    def __init__(self, mixer, thruster_pins, chip_num=4):
         self.thruster_pins = thruster_pins
-        self.amperage_limit_per_unit = AMPERAGE_LIMIT / thruster_pins.__len__() # Amperage limit per thruster
-        
-        for pin in thruster_pins:
-            self.pi.set_servo_pulsewidth(pin, ESC_NEUTRAL)  # Initialize all thrusters to neutral (arming)
-            self.pi.set_PWM_frequency(pin, 50) # Set frequency to 50Hz
+        self.mixer = np.array(mixer)
+        self.amperage_limit_per_unit = AMPERAGE_LIMIT / len(thruster_pins)
 
-    def set_thruster(self, input):
+        # Open connection to RP1 GPIO Chip (gpiochip4 on Pi 5)
+        try:
+            self.chip = lgpio.gpiochip_open(chip_num)
+            print(f"Connected to gpiochip{chip_num} via lgpio.")
+        except Exception as e:
+            raise RuntimeError(f"Failed to open gpiochip{chip_num}: {e}")
+
+        # Claim output pins and initialize ESCs to neutral (arming)
+        for pin in self.thruster_pins:
+            lgpio.gpio_claim_output(self.chip, pin)
+            # Send 1500us neutral pulse at 50Hz for ESC arming
+            lgpio.tx_servo(self.chip, pin, ESC_NEUTRAL, 50)
+
+        time.sleep(2)  # Allow time for ESCs to arm
+
+    def set_thruster(self, input_vector):
         '''
-        Input is a 6-element array: [Surge, Sway, Heave, Roll, Pitch, Yaw], each in range [-1, 1]
-        Comes from get_input_vector() func in controls.py, which will be called in the main loop of the program.
+        input_vector: 6-element array [Surge, Sway, Heave, Roll, Pitch, Yaw], range [-1, 1]
         '''
-        print("mixer shape:", self.mixer.shape)  # Should be (N, 6) or similar 2D
-        print("input shape:", input.shape)  
-        thruster_outputs = np.matmul(self.mixer, input)  # Matrix multiplication to get thruster outputs
+        input_arr = np.array(input_vector)
+
+        # Matrix multiplication to calculate thruster force vectors
+        thruster_outputs = np.matmul(self.mixer, input_arr).T
+
+        # Normalize outputs if any value exceeds absolute range of 1.0
         max_value = np.max(np.abs(thruster_outputs))
-        if max_value > 1:
-            thruster_outputs /= max_value  # Normalize to keep within [-1, 1]
-    
-        # Change thruster outputs from [-1, 1] to [1200, 1800] microseconds for ESC control
-        pwm = (thruster_outputs * 300 + ESC_NEUTRAL).astype(int)  # Scale to ESC pulse width range (1100-1900 microseconds)
-        pwm = np.clip(pwm, ESC_MIN, ESC_MAX)  # Ensure PWM values are within ESC limits
-        
-        for pin in range(len(self.thruster_pins)):
-            self.pi.set_servo_pulsewidth(self.thruster_pins[pin], pwm[pin])  # Send PWM signal to thruster
-            time.sleep(0.00005)  # Small delay to ensure signal is sent properly
+        if max_value > 1.0:
+            thruster_outputs /= max_value
+
+        # Scale outputs from [-1, 1] to microseconds range around ESC_NEUTRAL
+        # e.g., 1.0 -> 1700us, -1.0 -> 1300us
+        pwm_us = (thruster_outputs * 212 + ESC_NEUTRAL).astype(int)
+
+        # Clamp values strictly between ESC boundaries
+        pwm_us = np.clip(pwm_us, ESC_MIN, ESC_MAX)
+
+        # Send updated servo signals to all connected pins
+        for pin, pulse_width in zip(self.thruster_pins, pwm_us):
+            lgpio.tx_servo(self.chip, pin, int(pulse_width), 50)
 
     def stop(self):
-         '''Set thruster to neutral to stop'''
-         for pin in range(len(self.thruster_pins)):
-            self.pi.set_servo_pulsewidth(self.thruster_pins[pin], ESC_NEUTRAL)
+        '''Set all thruster pulse widths back to neutral'''
+        for pin in self.thruster_pins:
+            lgpio.tx_servo(self.chip, pin, ESC_NEUTRAL, 50)
+
+    def cleanup(self):
+        '''Stop signals and release gpiochip handle'''
+        self.stop()
+        time.sleep(0.1)
+        lgpio.gpiochip_close(self.chip)
+        print("GPIO chip connection closed successfully.")
+
 
 if __name__ == "__main__":
-    thrustsys = Thruster("192.168.0.2", 8888,mixer, [16, 17, 22, 25, 26, 27])
-    thrustsys.set_thruster([1, 0, 0, 0, 0, 0])  # Example input vector for surge forward
-    time.sleep(5)
-    thrustsys.stop()
-    print("Thrusters stopped successfully.")
+    # Instantiating Thruster with mixer matrix and pin assignments
+    thrustsys = Thruster(mixer, thruster_pins)
+
+    try:
+        print("Applying forward surge...")
+        thrustsys.set_thruster([1, 0, 0, 0, 0, 0])
+        time.sleep(5)
+
+    finally:
+        thrustsys.stop()
+        thrustsys.cleanup()
+        print("Thrusters stopped and cleaned up.")
 
 
 '''
